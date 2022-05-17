@@ -1,0 +1,603 @@
+﻿using App.Base.Extensions;
+using Microsoft.EntityFrameworkCore;
+using QLab.Robot.Bankrupt.Efrsb.MessageService.Data;
+using QLab.Robot.Bankrupt.Efrsb.MessageService.Dto;
+using QLab.Robot.Bankrupt.Efrsb.MessageService.Models;
+using QLab.Robot.Bankrupt.Efrsb.MessageService.Models.WSLawyerModels;
+using QLab.Robot.Bankrupt.Efrsb.MessageService.Static;
+
+namespace QLab.Robot.Bankrupt.Efrsb.MessageService.Services
+{
+    internal class TaskManager
+    {
+        private readonly MessageServiceDbContext _context;
+        private readonly WSLawyerDbContext _wslContext;
+
+        public TaskManager(MessageServiceDbContext context, WSLawyerDbContext wslContext)
+        {
+            _context = context;
+            _wslContext = wslContext;
+        }
+
+        internal async Task CreateTasksAsync()
+        {
+            var settings = await _context.MessageActionSettings
+                .AsNoTracking()
+                .Include(x => x.ActionType)
+                .Include(x => x.Tasks)
+                .ThenInclude(x => x.ExecutorType)
+                .Include(x => x.Tasks)
+                .ThenInclude(x => x.TaskType)
+                .ToListAsync();
+
+            var bankruptcyCases = await _wslContext.BankruptcyCases
+                .AsNoTracking()
+                .ToListAsync();
+
+#if (DEBUG) //todo: use server [staging]
+            //for demo
+            await CreateDemoPotentialBankruptsAsync(settings, bankruptcyCases);
+#endif
+            var messages = await _context.EfrsbMessages!
+                .AsNoTracking()
+                .Where(x => !x.IsClosed && x.MessageContent != null && !x.IsFailed)
+                .ToListAsync();
+
+            foreach (var efrsbMessage in messages)
+            {
+                if (!string.IsNullOrEmpty(efrsbMessage.MessageContent))
+                {
+                    MessageParser.Parse(efrsbMessage.MessageContent, out var message);
+
+                    if (message != null)
+                    {
+                        CreateJTaskResult? result = await CreateTasksByMessageAsync(message, settings, bankruptcyCases);
+
+                        if (result == null) //Subject not found
+                        {
+                            _context.Remove(efrsbMessage);
+                            await _context.SaveChangesAsync();
+                        }
+                        else if (result.IsSucceeded)
+                        {
+                            efrsbMessage.IsClosed = true;
+                            await _context.SaveChangesAsync();
+                        }
+                        else
+                        {
+                            efrsbMessage.IsFailed = true;
+                            if (result.InnerResults!.Where(x => x.Message
+                            .Contains("not_found_bancrupcy_case_exception")).Any())
+                            {
+                                //обработчик реализован в теле CreateTasksByMessageAsync
+                            }
+                            var brokenMessage = new BrokenMessage
+                            { 
+                                EfrsbMessage = efrsbMessage, 
+                                Errors = string.Join("; ", result.InnerResults!.Select(x=>x.Message))
+                            };
+                                _context.BrokenMessages.Add(brokenMessage);                          
+                            await _context.SaveChangesAsync();
+                            //todo:   send mail to project curator  
+                        }
+                    }
+                }
+            }
+        }
+
+        private async Task CreateDemoPotentialBankruptsAsync(List<MessageActionSetting> settings, List<WslCaseBankruptcy> bankruptcyCases)
+        {
+            //for demo
+            if (!_context.PotentialBankrupts.Any())
+            {
+                //{//del
+                //    var mess = new Message
+                //    {
+                //        MessageType = MessageTypes.AppointAdministration,
+                //        EfrsbId = "8250423",
+                //        PublishDate = new DateTime(2020, 12, 20),
+                //        BankruptInfo = new BankruptCompany
+                //        {
+                //            Name = "АКБ \"ИНКАРОБАНК\" (АО)"
+                //        },
+                //        Text = "Привет от робота банкрота для Инкаробанк"
+                //    };
+                //    await CreateTasksByMessageAsync(mess, settings, bankruptcyCases); //Создание комментария в делах тестового субъекта
+                //}//-del
+
+                List<PotentialBankrupt> bankrupts = new();
+
+                var ulsubjs = await _wslContext.Subjects
+                    .AsNoTracking()
+                    .OrderByDescending(x => x.Id)
+                    .Where(x => x.StatusJuridical == JuridicalStatuses.Company)
+                    .Take(4)
+                    .ToListAsync();
+
+                var flsubjs = await _wslContext.Subjects
+                    .AsNoTracking()
+                    .OrderByDescending(x => x.Id)
+                    .Where(x => x.StatusJuridical == JuridicalStatuses.Person)
+                    .Take(4)
+                    .ToListAsync();
+                for(int i = 0; i < flsubjs.Count; i++)
+                {
+                    if(i % 2 == 0)
+                    {
+                        if (string.IsNullOrEmpty(flsubjs[i].Snils))
+                            flsubjs[i].Snils = "0000000000".Replace("0", $"{i}");
+                    }
+                }
+
+                var ipsubjs = await _wslContext.Subjects
+                    .AsNoTracking()
+                    .OrderByDescending(x => x.Id)
+                    .Where(x => x.StatusJuridical == JuridicalStatuses.IP)
+                    .Take(4)
+                    .ToListAsync();
+
+                var subjs = new List<WslSubject>();
+                subjs.AddRange(ipsubjs);
+                subjs.AddRange(flsubjs);
+                subjs.AddRange(ulsubjs);
+                List<string> messtypes = new()
+                {
+                    MessageTypes.AppointAdministration,
+                    MessageTypes.ActDealInvalid,
+                    MessageTypes.ActDealInvalid2,
+                    MessageTypes.ActPersonSubsidiary,
+                    MessageTypes.ChangeAuction,
+                    MessageTypes.ActDealInvalid,
+                    MessageTypes.ActDealInvalid2,
+                    MessageTypes.ActPersonSubsidiary,
+                    MessageTypes.ChangeAuction,
+                    MessageTypes.EstimatesAndUnsoldAssets,
+                    MessageTypes.CompletionOfExtrajudicialBankruptcy,
+                    MessageTypes.CreditorChoiceRightSubsidiary,
+                };
+
+                for (int i = 0; i < subjs.Count; i++)
+                {
+                    var mess = new Message
+                    {
+                        MessageType = messtypes[i],
+                        EfrsbId = $"{8250141 + 1000 * i - 100 - i}",
+                        PublishDate = DateTime.Now.AddDays(-1),
+                    };
+
+                    var potentialBankrupt = CreatePotentialBankrupt(subjs[i], mess, settings);
+                    bankrupts.Add(potentialBankrupt);
+                }
+
+                await _context.PotentialBankrupts.AddRangeAsync(bankrupts);
+                await _context.SaveChangesAsync(); // добавлен один потенциальный банкрот (демо данные)
+            }
+        }
+        private async Task AddPotentialBankrupt(WslSubject subject, Message message, List<MessageActionSetting> settings)
+        {
+            if (_context.PotentialBankrupts.Where(x => x.SubjectId == subject.Id).Any())
+                return;
+            PotentialBankrupt potentialBankrupt = CreatePotentialBankrupt(subject, message, settings);
+            _context.PotentialBankrupts.Add(potentialBankrupt);
+            await _context.SaveChangesAsync();
+        }
+
+        private PotentialBankrupt CreatePotentialBankrupt(WslSubject subject, Message message, List<MessageActionSetting> settings)
+        {
+            return subject.StatusJuridical switch
+            {
+                JuridicalStatuses.Person => new FlPotentialBankrupt(subject, message, settings),
+                JuridicalStatuses.IP => new IpPotentialBankrupt(subject, message, settings),
+                JuridicalStatuses.Company => new UlPotentialBankrupt(subject, message, settings),
+                _ => new SimplePotentialBankrupt(subject, message, settings),
+            };
+        }
+
+        private bool GetDisableCaseTrackingFlag(WslSubjectCase? subjectCase, List<WslCaseBankruptcy> bankruptcyCases)
+        {
+            if (subjectCase == null)
+                return true; //если дело не существует не создавать в нем задачи
+            var caseTracking = bankruptcyCases
+                            .FirstOrDefault(x => x.CaseId == subjectCase.CaseId);
+            if (caseTracking == null)
+                return false; //если для дела не задана настройка "Отключить мониторинг ЕФРСБ", то создавать в нем задачи
+            var disableCaseTracking = caseTracking!.DisableCaseTracking ?? false;
+            return disableCaseTracking; //вернуть значение флага "Отключить мониторинг ЕФРСБ"
+        }
+
+        private async Task<CreateJTaskResult?> CreateTasksByMessageAsync(Message message, List<MessageActionSetting> settings, List<WslCaseBankruptcy> bankruptcyCases)
+        {
+            var jSubjects = await GetJSubjectWithDetailsAsync(message.BankruptInfo);
+            if (jSubjects == null)
+                return null;
+
+            if (!jSubjects.Any())
+                return null;
+
+
+            CreateJTaskResult jResult = new();
+            foreach (var jSubject in jSubjects)
+            {
+                var bankruptCases = jSubject.Cases!
+<<<<<<< HEAD
+                    .Where(x => x.Status == WslCaseTypes.Bankruptcy)
+=======
+                    .Where(x => x.Status ==  WslCaseTypes.Bankruptcy)
+>>>>>>> test
+                    .ToList();
+                if (bankruptCases.Any())
+                {
+                    var setting = settings.FirstOrDefault(x => x.NormalizedKey == message.MessageType?.Normalize(Case.Upp));
+                    if (setting == null)
+                    {
+                        var errorResult = new CreateJTaskResult(isFailed: true)
+                        {
+                            Message = $"В справочниках отсутствует настройка для типа сообщения \"{message.MessageType}\""
+                        };
+                        jResult.InnerResults?.Add(errorResult);
+                        return jResult;
+                    }
+                    foreach (var jcase in bankruptCases!)
+                    {
+                        if (!GetDisableCaseTrackingFlag(jcase, bankruptcyCases))
+                            await CreateJTasksAsync(jcase, message, setting, jResult);
+                    }
+                    return jResult;
+                }
+                else
+                {
+                    await AddPotentialBankrupt(jSubject, message, settings); //создание записи о потенциальном банкроте
+
+                    var errorResult = new CreateJTaskResult(isFailed: true)
+                    {
+                        Message = $"Для субъекта ID={jSubject.Id}, Name={jSubject.Name} не найдено ни одного банкротного дела (not_found_bancrupcy_case_exception)"
+                    };
+                    jResult.InnerResults?.Add(errorResult);
+                    return jResult;
+                }
+            }
+            return jResult;
+        }
+
+        private async Task CreateJTasksAsync(WslSubjectCase jcase, Message message, MessageActionSetting? setting, CreateJTaskResult jResult)
+        {
+            //bool isCreatedTasks = false;
+            if (setting != null)
+            {
+                if (setting.ActionType?.Name == ActionTypes.Comment)
+                {
+                    var result = await CreateJCommentAsync(jcase, message);
+                    if (!result)
+                    {
+                        var errorResult = new CreateJTaskResult(isFailed: true)
+                        {
+                            Message = $"Не удалось создать комментарий в деле с ID={jcase.Id} для сообщения типа \"{message.MessageType}\" с EFRSBID={message.EfrsbId}"
+                        };
+                        jResult.InnerResults?.Add(errorResult);
+                    }
+                }
+                else if (setting.ActionType?.Name == ActionTypes.Task)
+                {
+                    if (setting.Tasks != null)
+                        foreach (var jtask in setting.Tasks)
+                        {
+                            bool result = await CreateJTaskAsync(jcase.CaseId, jtask);
+                            if (!result)
+                            {
+                                var errorResult = new CreateJTaskResult(isFailed: true)
+                                {
+                                    Message = $"Не удалось создать задачу \"{jtask.TaskType!.Name}\" в деле с ID={jcase.Id} для сообщения типа \"{message.MessageType}\" с EFRSBID={message.EfrsbId}"
+                                };
+                                jResult.InnerResults?.Add(errorResult);
+                            }
+                        }
+                    else
+                    {
+                        var errorResult = new CreateJTaskResult(isFailed: true)
+                        {
+                            Message = $"Настройка для типа сообщений {message.MessageType} содержит пустой список задач (EFRSBID={message.EfrsbId}"
+                        };
+                        jResult.InnerResults?.Add(errorResult);
+                    }
+                }
+            }
+        }
+        
+        private async Task<bool> CreateJCommentAsync(WslSubjectCase jcase, Message message)
+        {
+            if (jcase?.CaseId == null || jcase?.CaseId <= 0)
+                return false;
+
+            //int csValue;
+            //var case_ = _jurisContext.JCases.FirstOrDefault(x => x.Id == caseId);
+            //csValue = GetCurrentCourtSession(caseId).Result.Id;
+
+            var addComment = new WslInformationOnCase();
+            var dt = DateTime.Now;
+            addComment.DateCreate = dt;
+            addComment.DateUpdate = dt;
+            addComment.UserIdcreator = 1;
+            addComment.UserIdupdate = 1;
+            addComment.Comment = message.Text ?? "Робот Банкрот: \"Получено пустое сообщение от ЕФРСБ\"";
+            addComment.CaseId = jcase?.CaseId;
+            //addComment.Case = _jurisContext.JCases.FirstOrDefault(x => x.Id == jcase.CaseId);
+            addComment.OrderWeight = await _wslContext.InformationOnCases.MaxAsync(x => x.OrderWeight) + 1;
+
+            try
+            {
+                _wslContext.InformationOnCases.Add(addComment);
+                await _wslContext.SaveChangesAsync();
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                //todo: log error
+                return false;
+            }
+        }
+
+        private async Task<List<WslSubject>?> GetJSubjectWithDetailsAsync(BankruptInfo? bankruptInfo)
+        {
+            ////del
+            //return new JSubject
+            //{
+            //    Cases = new List<JSubjectCase>
+            //    {
+            //        new JSubjectCase
+            //        {
+            //            CaseId = 319985
+            //        }
+            //    }
+            //};
+            ////-del
+            try
+            {
+                if(bankruptInfo == null)
+                    return null;
+
+                if (bankruptInfo is BankruptCompany)
+                {
+                    BankruptCompany bankruptCompany = (BankruptCompany)bankruptInfo;
+                    var jSubjects = _wslContext.Subjects
+                        .Include(x => x.Cases)
+                        .Where(x => (x.StatusJuridical == JuridicalStatuses.Company
+                        || x.StatusJuridical == JuridicalStatuses.IP)
+                        && (x.Inn == bankruptCompany.Inn
+                        || x.Ogrn == bankruptCompany.Ogrn))
+                        .ToList();
+
+                    if (jSubjects!.Any())
+                        return jSubjects;
+
+
+                    //var regexName = Regex.Replace(bankruptCompany.Name, "[^а-яА-Яa-zA-Z0-9() ]", "");
+                    var regexCompanyName = bankruptCompany.Name!.Replace("\"", "");
+                    
+
+                    jSubjects = _wslContext.Subjects
+                        .Include(x => x.Cases)
+                        .Where(x => (x.StatusJuridical == JuridicalStatuses.Company
+                        || x.StatusJuridical == JuridicalStatuses.IP)
+                        && x.FullName.Replace("\"","").Replace("«", "").Replace("»", "").Contains(regexCompanyName)
+                        )
+                        .ToList();
+
+                    if (jSubjects!.Any())
+                        return jSubjects;
+
+                    jSubjects = _wslContext.Subjects
+                        .Include(x => x.Cases)
+                        .Where(x => (x.StatusJuridical == JuridicalStatuses.Company
+                        || x.StatusJuridical == JuridicalStatuses.IP)
+                        && x.Name.Replace("\"", "").Replace("«", "").Replace("»", "").Contains(regexCompanyName)
+                        )
+                        .ToList();
+
+                    if (jSubjects!.Any())
+                        return jSubjects;
+
+                    return null;
+                }
+                else if (bankruptInfo is BankruptPerson)
+                {
+                    BankruptPerson bankruptPerson = (BankruptPerson)bankruptInfo;
+
+                    var jSubjects = _wslContext.Subjects
+                        .Include(x => x.Cases)
+                        .Where(x => x.StatusJuridical == JuridicalStatuses.Person 
+                        && x.Inn == bankruptPerson.Inn)
+                        .ToList();
+
+                    if (jSubjects!.Any())
+                        return jSubjects;
+
+
+
+                    jSubjects = _wslContext.Subjects
+                        .Include(x => x.Cases)
+                        .Where(x => x.StatusJuridical == JuridicalStatuses.Person
+                        && x.FullName.Contains(bankruptPerson.Fio!.GetFullName()!)
+                        )
+                        .ToList();
+
+                    if (jSubjects!.Any())
+                        return jSubjects;
+
+                    jSubjects = _wslContext.Subjects
+                        .Include(x => x.Cases)
+                        .Where(x => x.StatusJuridical == JuridicalStatuses.Person
+                        && x.Name.Contains(bankruptPerson.Fio!.GetFullName()!)
+                        )
+                        .ToList();
+
+                        if (jSubjects!.Any())
+                            return jSubjects;
+
+                    return null;
+                }
+            }
+            catch (Exception ex)
+            {
+                return null;
+            }
+            return null;
+        }
+
+        private DateTime GetNearestWorkingDay(DateTime date)
+        {
+            try
+            {
+                if (_wslContext.WorkingCalendars.Any(x => x.DateDay.Date == date.Date))
+                {
+                    if (_wslContext.WorkingCalendars.FirstOrDefault(x => x.DateDay.Date == date.Date)!.IsWorkingDay!.Value)
+                        return date;
+                    else
+                    {
+                        var days = _wslContext.WorkingCalendars
+                            .Where(x => x.DateDay.Date > date.Date && x.IsWorkingDay!.Value).OrderBy(x => x.DateDay);
+                        var myday = days.FirstOrDefault();
+                        if (myday != null) return myday.DateDay;
+                        else return date;
+                    }
+                }
+                else return date;
+            }
+            catch (Exception e)
+            {
+                return date;
+            }
+        }
+
+        private async Task<WslCourtSession?> GetCurrentCourtSession(int caseId)
+        {
+            if (_wslContext.CourtSessions.Any(x => x.CaseId == caseId && x.StatusStage == 30))
+                return await _wslContext.CourtSessions.OrderByDescending(x => x.Id)
+                    .FirstOrDefaultAsync(x => x.CaseId == caseId && x.StatusStage == 30);
+            else
+                return await _wslContext.CourtSessions.SingleOrDefaultAsync(x =>
+                    x.CaseId == caseId && x.IsCurrent == true);
+
+
+        }
+
+        private long? GetLawyerByCaseId(int caseId)
+        {
+            var _case = _wslContext.Cases.FirstOrDefault(x => x.Id == caseId);
+
+            List<long?> excludedIds = new List<long?>() { -1, 0, 1, 11, 12, 10059, 10413, 10498 }; //todo: add setting
+
+            if (_case?.UserIdleader != null)
+            {
+                if(_case?.UserIdleader == 10059 || _case?.UserIdassistant ==10059) //архивное
+                {
+                    if (_case.ProjectId == 33 || _case.ProjectId == 47) //Пробизнесбанк
+                    {
+                        return 10413;
+                    }
+                    if (_case.ProjectId == 104) //Веб РФ
+                    {
+                        return null;
+                    }
+                }
+                if (!excludedIds.Contains(_case.UserIdleader)) //исключаем служебных пользователей
+                {                   
+                    return _case.UserIdleader;
+                }
+                else return null;
+            }
+            else
+            {
+                return null;
+            }
+        }
+
+        private long? GetApprenticeByCaseId(int caseId)
+        {
+            var _case = _wslContext.Cases.FirstOrDefault(x => x.Id == caseId);
+
+            List<long?> excludedIds = new List<long?>() { -1, 0, 1, 11, 12, 10059, 10413, 10498 }; //todo: add setting
+
+            if (_case?.UserIdassistant != null
+                && !_wslContext.DepartmentUsers.Where(x => x.DepartmentId == 3)
+                .ToList().Any(x => x.UserId == _case.UserIdassistant))
+            {
+                var taskExecutor = _case.UserIdassistant;
+                if (_case?.UserIdleader == 10059 || _case?.UserIdassistant == 10059) //архивное
+                {
+                    if (_case.ProjectId == 33 || _case.ProjectId == 47) //Пробизнесбанк
+                    {
+                        return 10413;
+                    }
+                    if (_case.ProjectId == 104) //Веб РФ
+                    {
+                        return null;
+                    }
+                }
+                if (excludedIds.Contains(taskExecutor))
+                {
+                    taskExecutor = null;
+                }
+
+                return taskExecutor;
+            }
+            return null;
+        }
+
+        private async Task<bool> CreateJTaskAsync(int caseId, MessageActionSettingTask jurisTask)
+        {
+            if (jurisTask.TaskType?.WSLawyerCode == null || jurisTask.TaskType?.WSLawyerCode <= 0)
+                return false;
+
+            int csValue;
+            var case_ = await _wslContext.Cases.FirstOrDefaultAsync(x => x.Id == caseId);
+            csValue = GetCurrentCourtSession(caseId).Result!.Id;
+
+            var addTask = new WslTask();
+            var dt = DateTime.Today;
+            addTask.CaseId = caseId;
+            addTask.UserIdcreator = 13;
+            addTask.UserIdupdate = 13;
+            addTask.DateCreate = DateTime.Now;
+            addTask.DateUpdate = DateTime.Now;
+            addTask.UserIdexecutor = GetExecutorId(caseId, jurisTask.ExecutorType?.Name);
+            addTask.StatusType = (int)jurisTask.TaskType?.WSLawyerCode!;
+            addTask.TaskTarget = "";
+            addTask.BeginDate = GetNearestWorkingDay(dt.AddDays(jurisTask.TimeLimit ?? 0));
+            addTask.DateEndPlan = GetNearestWorkingDay(dt.AddDays(jurisTask.TimeLimit ?? 0));
+            addTask.DateEndFact = GetNearestWorkingDay(dt.AddDays(jurisTask.TimeLimit ?? 0));
+            addTask.Status = 10;
+            addTask.Level = 0;
+            addTask.SpentTime = 0;
+            addTask.CourtSessionId = csValue;
+            addTask.IsEvent = false;
+            addTask.OnConfirmation = false;
+            addTask.StatusSectionAct = 90; //задачи от робота банкрота всегда будут попадать в раздел 90
+            addTask.IsNew = true;
+            addTask.IsStatusChange = true;
+            try
+            {
+                _wslContext.Tasks.Add(addTask);
+                await _wslContext.SaveChangesAsync();
+                await Task.Delay(10);
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                //todo: log error
+                return false;
+            }
+        }
+
+        private long? GetExecutorId(int caseId, string? name)
+        {
+            return name switch
+            {
+                (ExecutorTypes.Lawyer) => GetLawyerByCaseId(caseId),
+                (ExecutorTypes.Apprentice) => GetApprenticeByCaseId(caseId),
+                _ => null,
+            };
+        }
+    }
+}
